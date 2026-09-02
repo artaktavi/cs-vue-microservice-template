@@ -1,0 +1,160 @@
+name: service-template
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres-db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [app-network]
+
+  loki:
+    image: grafana/loki:3.4.2
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./observability/loki/config.yaml:/etc/loki/config.yaml:ro
+      - loki_data:/loki
+    restart: unless-stopped
+    networks: [app-network]
+
+  tempo:
+    image: grafana/tempo:2.8.2
+    command: ["-config.file=/etc/tempo/config.yaml"]
+    volumes:
+      - ./observability/tempo/config.yaml:/etc/tempo/config.yaml:ro
+      - tempo_data:/var/tempo
+    restart: unless-stopped
+    networks: [app-network]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.128.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports: ["4317:4317", "4318:4318"]
+    volumes:
+      - ./observability/otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      loki: { condition: service_started }
+      tempo: { condition: service_started }
+    restart: unless-stopped
+    networks: [app-network]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    ports: ["${PROMETHEUS_PORT:-9090}:9090"]
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      api-proxy: { condition: service_started }
+      app-service: { condition: service_started }
+      node-exporter: { condition: service_started }
+    restart: unless-stopped
+    networks: [app-network]
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    ports: ["${GRAFANA_PORT:-3000}:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      loki: { condition: service_started }
+      prometheus: { condition: service_started }
+      tempo: { condition: service_started }
+    restart: unless-stopped
+    networks: [app-network]
+
+  promtail:
+    image: grafana/promtail:3.4.2
+    command: ["-config.file=/etc/promtail/config.yaml", "-config.expand-env=true"]
+    environment:
+      DEPLOYMENT_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
+    volumes:
+      - ./observability/promtail/config.yaml:/etc/promtail/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      loki: { condition: service_started }
+    restart: unless-stopped
+    networks: [app-network]
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    restart: unless-stopped
+    networks: [app-network]
+
+  api-proxy:
+    build:
+      context: .
+      dockerfile: api-proxy/Dockerfile
+    ports: ["80:8080", "443:8443"]
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_HTTPS_PORT: ${API_PROXY_HTTPS_PORT:-443}
+      Kestrel__Endpoints__Http__Url: http://+:8080
+      Kestrel__Endpoints__Https__Url: https://+:8443
+      Kestrel__Endpoints__Https__Certificate__Path: ${KESTREL_CERTIFICATE_PATH:-/https/aspnetapp.pfx}
+      Kestrel__Endpoints__Https__Certificate__Password: ${KESTREL_CERTIFICATE_PASSWORD:-change-me}
+      Observability__OtlpEndpoint: http://otel-collector:4317
+    read_only: true
+    tmpfs: ["/tmp:size=50M"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      app-service: { condition: service_started }
+      otel-collector: { condition: service_started }
+    restart: unless-stopped
+    networks: [app-network]
+
+  app-service:
+    build:
+      context: .
+      dockerfile: app-service/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ConnectionStrings__AppDb: Host=postgres;Port=5432;Database=app_db;Username=app_service;Password=${APP_DB_PASSWORD}
+      Migrations__Path: /migrations/app_db
+      Observability__OtlpEndpoint: http://otel-collector:4317
+    volumes:
+      - ./postgres-db/migrations:/migrations:ro
+    read_only: true
+    tmpfs: ["/tmp:size=50M"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      otel-collector: { condition: service_started }
+    restart: unless-stopped
+    networks: [app-network]
+
+volumes:
+  postgres_data:
+  loki_data:
+  prometheus_data:
+  tempo_data:
+  grafana_data:
+
+networks:
+  app-network:
+    driver: bridge

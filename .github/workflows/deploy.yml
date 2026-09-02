@@ -1,0 +1,124 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment target
+        required: true
+        type: choice
+        options: [testing, production]
+      image_tag:
+        description: Prefer immutable sha-<full_commit_sha>
+        required: true
+        type: string
+      git_ref:
+        description: Optional deployment bundle ref for non-sha tags
+        required: false
+        type: string
+      deploy_api_proxy:
+        description: Deploy api-proxy
+        required: true
+        type: boolean
+        default: false
+      deploy_app_service:
+        description: Deploy app-service
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      deploy_ref: ${{ steps.ref.outputs.deploy_ref }}
+      services: ${{ steps.services.outputs.services }}
+      image_namespace: ${{ steps.meta.outputs.image_namespace }}
+    steps:
+      - name: Validate services
+        id: services
+        shell: bash
+        run: |
+          services=()
+          [[ "${{ inputs.deploy_api_proxy }}" == "true" ]] && services+=(api-proxy)
+          [[ "${{ inputs.deploy_app_service }}" == "true" ]] && services+=(app-service)
+          [[ ${#services[@]} -gt 0 ]] || { echo "Select at least one service." >&2; exit 1; }
+          echo "services=${services[*]}" >> "$GITHUB_OUTPUT"
+      - name: Resolve ref
+        id: ref
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.git_ref }}" ]]; then
+            ref="${{ inputs.git_ref }}"
+          elif [[ "${{ inputs.image_tag }}" == sha-* ]]; then
+            ref="${{ inputs.image_tag }}"
+            ref="${ref#sha-}"
+          else
+            echo "Provide git_ref for a non-sha image tag." >&2
+            exit 1
+          fi
+          echo "deploy_ref=$ref" >> "$GITHUB_OUTPUT"
+      - name: Derive image namespace
+        id: meta
+        shell: bash
+        run: echo "image_namespace=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: preflight
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.deploy_ref }}
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_PRIVATE_KEY }}
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ secrets.DEPLOY_PORT }}" "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+      - name: Create and upload deployment bundle
+        run: |
+          tar -czf deploy-bundle.tgz docker-compose.deploy.yml observability postgres-db/init postgres-db/migrations
+          ssh -p "${{ secrets.DEPLOY_PORT }}" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" "mkdir -p '${{ secrets.DEPLOY_PATH }}'"
+          scp -P "${{ secrets.DEPLOY_PORT }}" deploy-bundle.tgz "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:${{ secrets.DEPLOY_PATH }}/deploy-bundle.tgz"
+      - name: Deploy selected services
+        env:
+          DEPLOY_SERVICES: ${{ needs.preflight.outputs.services }}
+          IMAGE_NAMESPACE: ${{ needs.preflight.outputs.image_namespace }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          OPTIONAL_HEALTHCHECK_URL: ${{ secrets.DEPLOY_HEALTHCHECK_URL }}
+        shell: bash
+        run: |
+          ssh -p "${{ secrets.DEPLOY_PORT }}" "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            GHCR_USERNAME="${{ github.actor }}" \
+            GHCR_TOKEN="${{ secrets.GITHUB_TOKEN }}" \
+            DEPLOY_PATH="${{ secrets.DEPLOY_PATH }}" \
+            IMAGE_NAMESPACE="$IMAGE_NAMESPACE" IMAGE_TAG="$IMAGE_TAG" \
+            "DEPLOY_SERVICES='$DEPLOY_SERVICES'" OPTIONAL_HEALTHCHECK_URL="$OPTIONAL_HEALTHCHECK_URL" bash -s <<'EOF'
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+          [[ -f .env ]] || { echo "Expected $DEPLOY_PATH/.env" >&2; exit 1; }
+          tar -xzf deploy-bundle.tgz
+          cat > .env.release <<RELEASE_ENV
+          IMAGE_REGISTRY=ghcr.io
+          IMAGE_NAMESPACE=${IMAGE_NAMESPACE}
+          API_PROXY_IMAGE_TAG=${IMAGE_TAG}
+          APP_SERVICE_IMAGE_TAG=${IMAGE_TAG}
+          RELEASE_ENV
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
+          docker compose -f docker-compose.deploy.yml --env-file .env --env-file .env.release pull $DEPLOY_SERVICES
+          docker compose -f docker-compose.deploy.yml --env-file .env --env-file .env.release up -d $DEPLOY_SERVICES
+          running=$(docker compose -f docker-compose.deploy.yml --env-file .env --env-file .env.release ps --services --status running)
+          for service in $DEPLOY_SERVICES; do grep -qx "$service" <<< "$running"; done
+          if [[ -n "$OPTIONAL_HEALTHCHECK_URL" ]]; then curl --fail --retry 10 --retry-delay 5 "$OPTIONAL_HEALTHCHECK_URL"; fi
+          EOF

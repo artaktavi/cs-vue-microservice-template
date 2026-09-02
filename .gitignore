@@ -1,0 +1,9 @@
+bin/
+obj/
+.vs/
+.vscode/
+.env
+node_modules/
+dist/
+*.csproj.user
+

@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/shared/" />
+  <Project Path="api-proxy/api-proxy.csproj" />
+  <Project Path="app-service/app-service.csproj" />
+  <Folder Name="/app-service/Tests/">
+    <Project Path="app-service/Tests/AppService.IntegrationTests.csproj" />
+  </Folder>
+</Solution>
+
